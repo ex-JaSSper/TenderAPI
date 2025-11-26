@@ -1,4 +1,5 @@
 import os
+import base64
 import logging
 from fastapi import FastAPI
 import requests
@@ -7,12 +8,24 @@ import gspread
 from dotenv import load_dotenv
 from typing import List
 
+# -----------------------
+# Создание service_account.json из Base64 (для Render)
+# -----------------------
+creds_b64 = os.getenv("GOOGLE_CREDS_B64")
+if creds_b64:
+    with open("service_account.json", "w") as f:
+        f.write(base64.b64decode(creds_b64).decode("utf-8"))
+
+# Путь к файлу JSON для gspread
+GOOGLE_CREDENTIALS_FILE = "service_account.json"
+
+# -----------------------
 # Загружаем настройки из .env
+# -----------------------
 load_dotenv()
 
 API_TOKEN = os.getenv("API_TOKEN")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE")
 
 URL = "https://tenderplan.ru/api/tenders/v2/getlist"
 
@@ -21,15 +34,17 @@ if not API_TOKEN:
     raise RuntimeError("В .env не найден API_TOKEN")
 if not GOOGLE_SHEET_ID:
     raise RuntimeError("В .env не найден GOOGLE_SHEET_ID")
-if not GOOGLE_CREDENTIALS_FILE:
-    raise RuntimeError("В .env не найден GOOGLE_CREDENTIALS_FILE")
 
+# -----------------------
 # Логирование
+# -----------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 app = FastAPI(title="Tender Loader API")
 
+# -----------------------
 # Словарь способов размещения
+# -----------------------
 PLACING_WAYS = {
     0: "Иной способ",
     1: "Открытый конкурс",
@@ -64,9 +79,14 @@ PLACING_WAYS = {
     30: "Закупки малого объема"
 }
 
+
+# -----------------------
+# Вспомогательные функции
+# -----------------------
 def tender_ts(dt: datetime) -> int:
     """Перевод datetime в timestamp для API (в миллисекундах)"""
     return int(dt.timestamp() * 1000)
+
 
 def convert_timestamp(ts):
     """Перевод timestamp из API в читаемую дату"""
@@ -74,10 +94,12 @@ def convert_timestamp(ts):
         return datetime.fromtimestamp(ts / 1000).strftime('%d.%m.%Y %H:%M')
     return ""
 
+
 def get_sheet():
     """Получаем объект листа Google Sheet"""
     client = gspread.service_account(filename=GOOGLE_CREDENTIALS_FILE)
     return client.open_by_key(GOOGLE_SHEET_ID).sheet1
+
 
 def ensure_header(sheet):
     """Создаём заголовок, если его нет или он неправильный"""
@@ -97,6 +119,10 @@ def ensure_header(sheet):
             sheet.delete_rows(1)
         sheet.insert_row(header, 1)
 
+
+# -----------------------
+# Основной эндпоинт
+# -----------------------
 @app.get("/load-tenders")
 def load_tenders():
     """Выгрузка тендеров за вчерашний день"""
@@ -119,8 +145,8 @@ def load_tenders():
 
     while True:
         params = {
-            "fromPublicationDateTime": from_ts,  # начало публикации
-            "toPublicationDateTime": to_ts,      # конец публикации
+            "fromPublicationDateTime": from_ts,
+            "toPublicationDateTime": to_ts,
             "statuses": "1",
             "page": page
         }
@@ -133,7 +159,7 @@ def load_tenders():
         tenders = data.get("tenders", [])
 
         if not tenders:
-            break  # Останавливаем цикл, если нет данных
+            break
 
         all_tenders.extend(tenders)
         page += 1
