@@ -218,7 +218,7 @@ def fetch_attachments(tender_id, headers):
         resp = requests.get(
             f"{ATTACHMENTS_URL}?id={tender_id}",
             headers=headers,
-            timeout=10
+            timeout=40
         )
 
         # Проверяем статус код
@@ -349,7 +349,7 @@ def health_check():
             TENDERS_URL,
             headers={"Authorization": f"Bearer {API_TOKEN}"},
             params={"page": 0, "limit": 1},
-            timeout=5
+            timeout=25
         )
         if resp.status_code == 200:
             health_status["services"]["tenderplan_api"] = "✅ OK"
@@ -389,7 +389,7 @@ def parse_doc(url: str):
     try:
         # Скачиваем файл
         try:
-            file_resp = requests.get(url, timeout=30)
+            file_resp = requests.get(url, timeout=300)
             file_resp.raise_for_status()
         except requests.Timeout:
             error_manager.send_notification(
@@ -509,7 +509,7 @@ def load_tenders():
         try:
             ping_resp = requests.get(
                 "http://localhost:8000/ping",
-                timeout=5
+                timeout=25
             )
 
             if ping_resp.status_code != 200:
@@ -635,7 +635,7 @@ def load_tenders():
                     TENDERS_URL,
                     headers=headers,
                     params=params,
-                    timeout=15
+                    timeout=40
                 )
 
                 # Проверка статус кодов
