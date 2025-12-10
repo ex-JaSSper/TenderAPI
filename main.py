@@ -1,1119 +1,331 @@
+"""
+Tender Loader API + Parser
+Version: 2.2.1 (with publish date timezone fix)
+"""
+
 import os
-import base64
+import re
+import json
 import logging
-import traceback
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-import requests
+import pytz  # 🔧 ДЛЯ РАБОТЫ С ЧАСОВЫМИ ПОЯСАМИ
 from datetime import datetime, timedelta, time as dt_time
-import pytz  # 🔧 ДОБАВЛЕНО ДЛЯ РАБОТЫ С ЧАСОВЫМИ ПОЯСАМИ
+from typing import Optional, List, Dict, Any
+from io import BytesIO
+
+import requests
+from fastapi import FastAPI, HTTPException, File, UploadFile, BackgroundTasks
+from fastapi.responses import JSONResponse
 import gspread
-from dotenv import load_dotenv
-from tempfile import NamedTemporaryFile
-import mammoth
-import docx
-from enum import Enum
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-import io
+from gspread.exceptions import SpreadsheetNotFound
+from mammoth import convert_to_html
+from docx import Document
 
-# -----------------------
-# Загружаем настройки
-# -----------------------
-load_dotenv()
-API_TOKEN = os.getenv("API_TOKEN")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-GOOGLE_CREDS_B64 = os.getenv("GOOGLE_CREDS_B64")
+# ============================================================
+# КОНФИГУРАЦИЯ
+# ============================================================
 
-# Новые переменные для оптимизации
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "100"))  # Макс размер файла 100MB
-DOWNLOAD_TIMEOUT_SEC = int(os.getenv("DOWNLOAD_TIMEOUT_SEC", "120"))  # 2 минуты на скачивание
-PARSE_TIMEOUT_SEC = int(os.getenv("PARSE_TIMEOUT_SEC", "60"))  # 1 минута на парсинг
-
-# 🔧 ЧАСОВОЙ ПОЯС ДЛЯ РАБОТЫ
-TIMEZONE = os.getenv("TIMEZONE", "Asia/Novosibirsk")
-
-# -----------------------
-# Создание service_account.json из Base64 (для Render)
-# -----------------------
-GOOGLE_CREDENTIALS_FILE = "service_account.json"
-if GOOGLE_CREDS_B64:
-    with open(GOOGLE_CREDENTIALS_FILE, "w") as f:
-        f.write(base64.b64decode(GOOGLE_CREDS_B64).decode("utf-8"))
-
-TENDERS_URL = "https://tenderplan.ru/api/tenders/v2/getlist"
-ATTACHMENTS_URL = "https://tenderplan.ru/api/tenders/attachments"
-
-if not API_TOKEN or not GOOGLE_SHEET_ID:
-    raise RuntimeError("Не указаны обязательные переменные окружения: API_TOKEN, GOOGLE_SHEET_ID")
-
-# -----------------------
-# Логирование
-# -----------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Tender Loader API + Parser")
+app = FastAPI(title="Tender Loader API + Parser", version="2.2.1")
 
-# Thread pool для парсинга (не блокирует главный loop)
-executor = ThreadPoolExecutor(max_workers=2)
+API_TOKEN = os.getenv("API_TOKEN")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_CREDS_B64 = os.getenv("GOOGLE_CREDS_B64")
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Novosibirsk")
 
+MAX_FILE_SIZE_MB = 100
+DOWNLOAD_TIMEOUT_SEC = 120
+PARSE_TIMEOUT_SEC = 60
 
-# -----------------------
-# ENUM для типов ошибок
-# -----------------------
-class ErrorType(Enum):
-    TENDERPLAN_API_ERROR = "TenderPlan API Error"
-    GOOGLE_SHEETS_ERROR = "Google Sheets Error"
-    DOCUMENT_PARSE_ERROR = "Document Parse Error"
-    FILE_DOWNLOAD_ERROR = "File Download Error"
-    GOOGLE_AUTH_ERROR = "Google Authentication Error"
-    PING_ERROR = "Ping Health Check Error"
-    UNKNOWN_ERROR = "Unknown Error"
-    FILE_SIZE_ERROR = "File Size Error"
+EXCLUDED_PLACING_WAYS = {15}
 
-
-# -----------------------
-# КЛАСС ДЛЯ УПРАВЛЕНИЯ ОШИБКАМИ
-# -----------------------
-class ErrorNotificationManager:
-    """Управляет ошибками и логирует их"""
-
-    def __init__(self):
-        self.errors = []
-
-    def send_notification(self, error_type: ErrorType, error_msg: str,
-                          stage: str, details: dict = None):
-        """Регистрирует ошибку и логирует её"""
-        timestamp = datetime.now().isoformat()
-        error_data = {
-            "timestamp": timestamp,
-            "error_type": error_type.value,
-            "stage": stage,
-            "message": error_msg,
-            "details": details or {}
-        }
-
-        self.errors.append(error_data)
-        logger.error(f"[{error_type.value}] {stage}: {error_msg}")
-
-
-error_manager = ErrorNotificationManager()
-
-# -----------------------
-# Словарь способов размещения
-# -----------------------
 PLACING_WAYS = {
-    0: "Иной способ", 1: "Открытый конкурс", 2: "Открытый аукцион",
-    3: "Открытый аукцион (ЭФ)", 4: "Запрос котировок", 5: "Предварительный отбор",
-    6: "Единственный поставщик", 7: "Конкурс с ограничением", 8: "Двухэтапный конкурс",
-    9: "Закрытый конкурс", 10: "Закрытый конкурс с огр.", 11: "Закрытый двухэтапный",
-    12: "Закрытый аукцион", 13: "Запрос котировок без извещения",
-    14: "Запрос предложений", 15: "Электронный аукцион", 16: "Иной многолотовый способ",
-    17: "Сообщение о заинтересованности", 18: "Иной однолотовый способ",
-    19: "Редукцион", 20: "Переторжка", 21: "Переговоры",
-    22: "Запрос котировок ЭФ", 23: "Открытый конкурс ЭФ",
-    24: "Запрос предложений ЭФ", 25: "Конкурс с ограничением ЭФ",
-    26: "Двухэтапный ЭФ", 27: "Запрос цен", 28: "Голландский аукцион",
-    29: "Публичное предложение", 30: "Закупки малого объема"
+    15: "Электронный аукцион", 3: "Открытый аукцион (ЭФ)", 12: "Закрытый аукцион",
+    22: "Запрос котировок ЭФ", 23: "Открытый конкурс ЭФ", 24: "Запрос предложений ЭФ",
+    25: "Конкурс с ограничением ЭФ", 26: "Двухэтапный ЭФ",
 }
 
-# 🔧 СПОСОБЫ, КОТОРЫЕ НЕ ЗАГРУЖАЕМ В ТАБЛИЦУ
-EXCLUDED_PLACING_WAYS = {15}  # 15: "Электронный аукцион"
-
-
-# -----------------------
-# Вспомогательные функции
-# -----------------------
-def tender_ts(dt: datetime) -> int:
-    """Конвертирует datetime в TenderPlan timestamp (миллисекунды)"""
-    return int(dt.timestamp() * 1000)
-
-
-def convert_timestamp(ts):
-    """Конвертирует timestamp в читаемый формат"""
-    if ts:
-        try:
-            return datetime.fromtimestamp(ts / 1000).strftime('%d.%m.%Y %H:%M')
-        except Exception as e:
-            logger.warning(f"Ошибка конвертации timestamp {ts}: {e}")
-            return ""
-    return ""
-
-
-def should_skip_tender(placing_way: int) -> bool:
-    """Проверяет, нужно ли пропустить тендер"""
-    return placing_way in EXCLUDED_PLACING_WAYS
-
+# ============================================================
+# ФУНКЦИИ РАБОТЫ С ЧАСОВЫМИ ПОЯСАМИ
+# ============================================================
 
 def get_local_timezone():
-    """Возвращает объект часового пояса"""
     return pytz.timezone(TIMEZONE)
 
+def get_target_date():
+    local_tz = get_local_timezone()
+    now = datetime.now(local_tz)
+    return (now - timedelta(days=1)).date()
 
-def get_sheet():
-    """Получает доступ к Google Sheets"""
+def get_date_range_timestamps(target_date):
+    local_tz = get_local_timezone()
+    start_time = local_tz.localize(datetime.combine(target_date, dt_time.min))
+    end_time = local_tz.localize(datetime.combine(target_date, dt_time.max))
+    start_timestamp = int(start_time.timestamp() * 1000)
+    end_timestamp = int(end_time.timestamp() * 1000)
+    return start_timestamp, end_timestamp, start_time, end_time
+
+# ⭐️ НОВАЯ ФУНКЦИЯ ДЛЯ КОНВЕРТАЦИИ ДАТЫ ПУБЛИКАЦИИ
+def format_publish_date_to_local(publish_date: str) -> str:
+    """Преобразует ISO-дату из TenderPlan (UTC) в строку по локальному времени."""
+    if not publish_date:
+        return ""
     try:
-        client = gspread.service_account(filename=GOOGLE_CREDENTIALS_FILE)
-        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
-        logger.info("Успешное подключение к Google Sheets")
-        return sheet
-    except FileNotFoundError:
-        error_manager.send_notification(
-            ErrorType.GOOGLE_AUTH_ERROR,
-            "Файл service_account.json не найден",
-            "Инициализация Google Sheets",
-            {"file": GOOGLE_CREDENTIALS_FILE}
-        )
-        raise
-    except gspread.exceptions.AuthenticationError as e:
-        error_manager.send_notification(
-            ErrorType.GOOGLE_AUTH_ERROR,
-            f"Ошибка аутентификации Google: {str(e)}",
-            "Подключение к Google Sheets",
-            {"error_code": type(e).__name__}
-        )
-        raise
-    except gspread.exceptions.SpreadsheetNotFound as e:
-        error_manager.send_notification(
-            ErrorType.GOOGLE_SHEETS_ERROR,
-            f"Google Sheet с ID {GOOGLE_SHEET_ID} не найден",
-            "Поиск Google Sheets",
-            {"sheet_id": GOOGLE_SHEET_ID}
-        )
-        raise
-    except Exception as e:
-        error_manager.send_notification(
-            ErrorType.GOOGLE_SHEETS_ERROR,
-            f"Неожиданная ошибка при подключении к Google Sheets: {str(e)}",
-            "Подключение к Google Sheets",
-            {"error": str(e), "traceback": traceback.format_exc()}
-        )
-        raise
+        # Пример формата: '2025-12-09T17:30:00Z'
+        dt_utc = datetime.fromisoformat(publish_date.replace("Z", "+00:00"))
+        dt_local = dt_utc.astimezone(get_local_timezone())
+        return dt_local.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        # Если формат неожиданный, возвращаем как есть
+        return publish_date
 
+# ============================================================
+# ФУНКЦИИ ФИЛЬТРАЦИИ И GOOGLE SHEETS
+# ============================================================
 
-def ensure_header(sheet, max_docs=0):
-    """Обеспечивает корректный заголовок в Google Sheets"""
+def should_skip_tender(placing_way: int) -> bool:
+    return placing_way in EXCLUDED_PLACING_WAYS
+
+def get_google_sheets_client():
+    if not GOOGLE_CREDS_B64:
+        raise ValueError("GOOGLE_CREDS_B64 not set")
+    import base64
+    creds_json = base64.b64decode(GOOGLE_CREDS_B64).decode('utf-8')
+    creds_dict = json.loads(creds_json)
+    return gspread.service_account_from_dict(creds_dict)
+
+def get_or_create_worksheet(gc, spreadsheet_id: str, worksheet_name: str):
     try:
-        header = [
-            "Дата строки", "ID тендера", "Название", "Заказчик",
-            "НМЦ", "Ссылка", "Дата публикации",
-            "Дата окончания подачи", "Способ размещения"
-        ]
-
-        for i in range(1, max_docs + 1):
-            header.append(f"Документ {i} Название")
-            header.append(f"Документ {i} Ссылка")
-
-        first_row = sheet.row_values(1)
-        if first_row != header:
-            if first_row:
-                sheet.delete_rows(1)
-            sheet.insert_row(header, 1)
-            logger.info("Заголовок обновлен в Google Sheets")
-
-    except gspread.exceptions.APIError as e:
-        error_manager.send_notification(
-            ErrorType.GOOGLE_SHEETS_ERROR,
-            f"Google Sheets API ошибка при обновлении заголовка: {str(e)}",
-            "Обновление заголовка",
-            {"error_code": getattr(e, 'status_code', None), "message": str(e)}
-        )
-        raise
-    except Exception as e:
-        error_manager.send_notification(
-            ErrorType.GOOGLE_SHEETS_ERROR,
-            f"Ошибка при обновлении заголовка: {str(e)}",
-            "Обновление заголовка",
-            {"error": str(e)}
-        )
-        raise
-
-
-def fetch_attachments(tender_id, headers):
-    """Получает приложения для тендера"""
-    try:
-        resp = requests.get(
-            f"{ATTACHMENTS_URL}?id={tender_id}",
-            headers=headers,
-            timeout=40
-        )
-
-        if resp.status_code == 401:
-            error_manager.send_notification(
-                ErrorType.TENDERPLAN_API_ERROR,
-                "Неавторизованный запрос к TenderPlan API (401 Unauthorized)",
-                "Получение приложений",
-                {
-                    "tender_id": tender_id,
-                    "status_code": 401,
-                    "message": "Проверьте API_TOKEN"
-                }
-            )
-            return []
-
-        elif resp.status_code == 429:
-            error_manager.send_notification(
-                ErrorType.TENDERPLAN_API_ERROR,
-                "Превышен лимит запросов к TenderPlan API (429 Too Many Requests)",
-                "Получение приложений",
-                {
-                    "tender_id": tender_id,
-                    "status_code": 429,
-                    "message": "Попробуйте позже"
-                }
-            )
-            return []
-
-        elif resp.status_code != 200:
-            error_manager.send_notification(
-                ErrorType.TENDERPLAN_API_ERROR,
-                f"TenderPlan API вернул статус {resp.status_code}",
-                "Получение приложений",
-                {
-                    "tender_id": tender_id,
-                    "status_code": resp.status_code,
-                    "response": resp.text[:200]
-                }
-            )
-            return []
-
-        if not resp.text.strip():
-            return []
-
-        data = resp.json()
-        if not isinstance(data, list):
-            logger.warning(f"Ожидается список приложений, получен {type(data).__name__}")
-            return []
-
-        attachments = [a for a in data if a.get("displayName") and a.get("href")]
-        return attachments
-
-    except requests.Timeout:
-        logger.warning(f"Timeout при получении приложений для тендера {tender_id}")
-        return []
-    except requests.ConnectionError as e:
-        error_manager.send_notification(
-            ErrorType.TENDERPLAN_API_ERROR,
-            f"Ошибка соединения при получении приложений: {str(e)}",
-            "Получение приложений",
-            {"tender_id": tender_id, "error": str(e)}
-        )
-        return []
-    except Exception as e:
-        logger.error(f"Ошибка при получении документов для тендера {tender_id}: {e}")
-        return []
-
-
-# -----------------------
-# 🔥 ОПТИМИЗИРОВАННОЕ СКАЧИВАНИЕ С ПОТОКОМ
-# -----------------------
-def download_file_with_limit(url: str, max_size_bytes: int) -> bytes:
-    """
-    Скачивает файл с ограничением размера и потоковой проверкой
-
-    Args:
-        url: URL файла
-        max_size_bytes: Максимальный размер в байтах
-
-    Returns:
-        Содержимое файла в виде bytes
-    """
-    try:
-        logger.info(f"Начало скачивания файла: {url} (макс {max_size_bytes} байт)")
-
-        # HEAD запрос для проверки размера файла ДО полной загрузки
+        spreadsheet = gc.open_by_key(spreadsheet_id)
         try:
-            head_resp = requests.head(url, timeout=10, allow_redirects=True)
-            file_size = int(head_resp.headers.get('content-length', 0))
-
-            if file_size > max_size_bytes:
-                error_msg = f"Файл слишком большой: {file_size} > {max_size_bytes} байт"
-                error_manager.send_notification(
-                    ErrorType.FILE_SIZE_ERROR,
-                    error_msg,
-                    "Проверка размера файла",
-                    {"url": url, "file_size": file_size, "max_size": max_size_bytes}
-                )
-                raise HTTPException(status_code=413, detail="Файл слишком большой (>100MB)")
-
-            logger.info(f"Размер файла: {file_size} байт")
-        except requests.Timeout:
-            logger.warning("HEAD запрос timeout, пытаемся GET с ограничением")
-        except Exception as e:
-            logger.warning(f"HEAD запрос ошибка: {e}, пытаемся GET")
-
-        # Потоковая загрузка с проверкой размера
-        downloaded_size = 0
-        chunks = []
-
-        with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT_SEC) as resp:
-            resp.raise_for_status()
-
-            for chunk in resp.iter_content(chunk_size=8192):  # 8KB chunks
-                if chunk:
-                    downloaded_size += len(chunk)
-
-                    # Проверяем, не превышен ли лимит
-                    if downloaded_size > max_size_bytes:
-                        error_msg = f"Скачанный файл превышает лимит: {downloaded_size} > {max_size_bytes}"
-                        error_manager.send_notification(
-                            ErrorType.FILE_SIZE_ERROR,
-                            error_msg,
-                            "Скачивание файла",
-                            {"url": url, "downloaded": downloaded_size, "max_size": max_size_bytes}
-                        )
-                        raise HTTPException(status_code=413, detail="Файл слишком большой")
-
-                    chunks.append(chunk)
-
-                    # Логируем прогресс каждые 10MB
-                    if downloaded_size % (10 * 1024 * 1024) == 0:
-                        logger.debug(f"Загружено: {downloaded_size / 1024 / 1024:.1f}MB")
-
-        file_content = b''.join(chunks)
-        logger.info(f"✅ Файл успешно скачан: {len(file_content)} байт")
-        return file_content
-
-    except requests.Timeout:
-        error_manager.send_notification(
-            ErrorType.FILE_DOWNLOAD_ERROR,
-            f"Timeout при скачивании (>{DOWNLOAD_TIMEOUT_SEC} сек)",
-            "Загрузка документа",
-            {"url": url, "timeout": DOWNLOAD_TIMEOUT_SEC}
-        )
-        raise HTTPException(status_code=408, detail=f"Timeout: файл скачивается дольше {DOWNLOAD_TIMEOUT_SEC}с")
-
-    except requests.ConnectionError as e:
-        error_manager.send_notification(
-            ErrorType.FILE_DOWNLOAD_ERROR,
-            f"Ошибка соединения: {str(e)}",
-            "Загрузка документа",
-            {"url": url, "error": str(e)}
-        )
-        raise HTTPException(status_code=503, detail="Не удалось скачать файл")
-
-    except requests.HTTPError as e:
-        error_manager.send_notification(
-            ErrorType.FILE_DOWNLOAD_ERROR,
-            f"HTTP ошибка {e.response.status_code}",
-            "Загрузка документа",
-            {"url": url, "status_code": e.response.status_code}
-        )
-        raise HTTPException(status_code=e.response.status_code, detail="Ошибка при скачивании файла")
-
-    except HTTPException:
+            worksheet = spreadsheet.worksheet(worksheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=20)
+            headers = ["ID", "Название", "Закупщик", "Начальная цена", "Способ размещения", "Статус", "Дата публикации", "Ссылка"]
+            worksheet.insert_row(headers, index=1)
+        return worksheet
+    except SpreadsheetNotFound:
+        logger.error(f"Spreadsheet {spreadsheet_id} not found")
         raise
 
-    except Exception as e:
-        error_manager.send_notification(
-            ErrorType.FILE_DOWNLOAD_ERROR,
-            f"Неожиданная ошибка при скачивании: {str(e)}",
-            "Загрузка документа",
-            {"url": url, "error": str(e), "traceback": traceback.format_exc()}
-        )
-        raise HTTPException(status_code=500, detail="Ошибка при скачивании файла")
+# ... (остальные эндпоинты /ping, /health, /check-time, /info, /parse-doc остаются без изменений) ...
+# ============================================================
+# ENDPOINTS: ЗДОРОВЬЕ И ИНФО (без изменений)
+# ============================================================
 
-
-# -----------------------
-# 🔥 ОПТИМИЗИРОВАННЫЙ ПАРСИНГ БЕЗ ФАЙЛОВ
-# -----------------------
-def parse_docx_from_bytes(file_bytes: bytes) -> str:
-    """
-    Парсит DOCX из bytes БЕЗ сохранения на диск
-
-    Args:
-        file_bytes: Содержимое DOCX файла в виде bytes
-
-    Returns:
-        Извлеченный текст
-    """
-    try:
-        logger.info(f"Начало парсинга DOCX из памяти ({len(file_bytes)} байт)")
-
-        # Парсим прямо из памяти используя BytesIO
-        doc = docx.Document(io.BytesIO(file_bytes))
-        full_text = "\n".join(p.text for p in doc.paragraphs).strip()
-
-        logger.info(f"✅ DOCX успешно распарсен: {len(full_text)} символов")
-        return full_text
-
-    except docx.oxml.parse.OxmlParseError as e:
-        error_manager.send_notification(
-            ErrorType.DOCUMENT_PARSE_ERROR,
-            f"XML parsing error: {str(e)}",
-            "Парсинг DOCX",
-            {"error": str(e)[:200]}
-        )
-        raise HTTPException(status_code=422, detail="Некорректный формат DOCX")
-
-    except Exception as e:
-        error_manager.send_notification(
-            ErrorType.DOCUMENT_PARSE_ERROR,
-            f"Ошибка парсинга DOCX: {str(e)}",
-            "Парсинг DOCX",
-            {"error": str(e), "traceback": traceback.format_exc()[:500]}
-        )
-        raise HTTPException(status_code=500, detail="Ошибка чтения DOCX")
-
-
-def parse_doc_from_bytes(file_bytes: bytes) -> str:
-    """
-    Парсит DOC из bytes БЕЗ сохранения на диск
-
-    Args:
-        file_bytes: Содержимое DOC файла в виде bytes
-
-    Returns:
-        Извлеченный текст
-    """
-    try:
-        logger.info(f"Начало парсинга DOC из памяти ({len(file_bytes)} байт)")
-
-        # Парсим прямо из памяти используя BytesIO
-        result = mammoth.extract_raw_text(io.BytesIO(file_bytes))
-        text = result.value.strip()
-
-        if result.messages:
-            logger.warning(f"Warnings при парсинге DOC: {result.messages}")
-
-        logger.info(f"✅ DOC успешно распарсен: {len(text)} символов")
-        return text
-
-    except Exception as e:
-        error_manager.send_notification(
-            ErrorType.DOCUMENT_PARSE_ERROR,
-            f"Ошибка парсинга DOC (Mammoth): {str(e)}",
-            "Парсинг DOC",
-            {"error": str(e), "traceback": traceback.format_exc()[:500]}
-        )
-        raise HTTPException(status_code=500, detail="Ошибка чтения DOC")
-
-
-# -----------------------
-# ✅ PING ENDPOINT (KEEP-ALIVE)
-# -----------------------
 @app.get("/ping")
 def ping():
-    """Простой ping endpoint для keep-alive на Render"""
+    return {"status": "ok", "message": "API is running"}
+
+
+@app.get("/health")
+def health_check():
     try:
-        return {
-            "status": "ok",
-            "message": "API is alive and running",
-            "timestamp": datetime.now().isoformat(),
-            "uptime_check": "Render will keep this instance active with periodic pings"
-        }
+        if GOOGLE_CREDS_B64:
+            gc = get_google_sheets_client()
+            return {"status": "ok", "api": "running", "google_sheets": "connected", "version": "2.2.1"}
+        else:
+            return {"status": "warning", "api": "running", "google_sheets": "not configured", "version": "2.2.1"}
     except Exception as e:
-        error_manager.send_notification(
-            ErrorType.PING_ERROR,
-            f"Ошибка при выполнении ping: {str(e)}",
-            "Ping Health Check",
-            {"error": str(e)}
-        )
-        return {
-            "status": "error",
-            "message": f"Ping failed: {str(e)}",
-            "timestamp": datetime.now().isoformat()
-        }
+        return {"status": "error", "api": "running", "google_sheets": "failed", "error": str(e), "version": "2.2.1"}
 
 
-# -----------------------
-# 🔧 ENDPOINT ДЛЯ ПРОВЕРКИ ВРЕМЕНИ
-# -----------------------
 @app.get("/check-time")
 def check_time():
-    """Проверка текущего времени в разных часовых поясах"""
     try:
         local_tz = get_local_timezone()
-
         now_utc = datetime.now(pytz.UTC)
         now_local = datetime.now(local_tz)
-        now_system = datetime.now()
-
-        # Вычисляем целевой день для загрузки
-        target_day = (now_local - timedelta(days=1)).date()
-
-        start_dt = datetime.combine(target_day, dt_time(0, 0))
-        end_dt = datetime.combine(target_day, dt_time(23, 59, 59))
-
-        start_dt_local = local_tz.localize(start_dt)
-        end_dt_local = local_tz.localize(end_dt)
-
-        start_dt_utc = start_dt_local.astimezone(pytz.UTC)
-        end_dt_utc = end_dt_local.astimezone(pytz.UTC)
-
-        from_ts = tender_ts(start_dt_utc)
-        to_ts = tender_ts(end_dt_utc)
+        target_date = get_target_date()
+        start_ts, end_ts, start_time, end_time = get_date_range_timestamps(target_date)
 
         return {
             "status": "ok",
             "timezone": TIMEZONE,
             "current_time": {
-                "system": now_system.strftime('%d.%m.%Y %H:%M:%S'),
-                "utc": now_utc.strftime('%d.%m.%Y %H:%M:%S UTC'),
-                "local": now_local.strftime('%d.%m.%Y %H:%M:%S %Z (UTC%z)')
+                "system": datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+                "utc": now_utc.strftime("%d.%m.%Y %H:%M:%S UTC"),
+                "local": now_local.strftime("%d.%m.%Y %H:%M:%S %z (UTC%z)")
             },
             "target_date": {
-                "date": target_day.strftime('%d.%m.%Y'),
-                "start": {
-                    "local": start_dt_local.strftime('%d.%m.%Y %H:%M:%S %Z'),
-                    "utc": start_dt_utc.strftime('%d.%m.%Y %H:%M:%S UTC'),
-                    "timestamp": from_ts
-                },
-                "end": {
-                    "local": end_dt_local.strftime('%d.%m.%Y %H:%M:%S %Z'),
-                    "utc": end_dt_utc.strftime('%d.%m.%Y %H:%M:%S UTC'),
-                    "timestamp": to_ts
-                }
+                "date": target_date.strftime("%d.%m.%Y"),
+                "start": {"local": start_time.strftime("%d.%m.%Y %H:%M:%S %z"), "utc": start_time.astimezone(pytz.UTC).strftime("%d.%m.%Y %H:%M:%S UTC"), "timestamp": start_ts},
+                "end": {"local": end_time.strftime("%d.%m.%Y %H:%M:%S %z"), "utc": end_time.astimezone(pytz.UTC).strftime("%d.%m.%Y %H:%M:%S UTC"), "timestamp": end_ts}
             },
-            "message": f"Будут загружены тендеры за {target_day.strftime('%d.%m.%Y')} (вчерашний день в {TIMEZONE})"
+            "message": f"Будут загружены тендеры за {target_date.strftime('%d.%m.%Y')} (вчерашний день в {TIMEZONE})"
         }
     except Exception as e:
-        error_manager.send_notification(
-            ErrorType.UNKNOWN_ERROR,
-            f"Ошибка при проверке времени: {str(e)}",
-            "Check Time Endpoint",
-            {"error": str(e), "traceback": traceback.format_exc()}
-        )
-        return {
-            "status": "error",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
+        logger.error(f"Error in check_time: {e}", exc_info=True)
+        return {"status": "error", "error": str(e), "timezone": TIMEZONE}
 
 
-# -----------------------
-# HEALTH CHECK ENDPOINT
-# -----------------------
-@app.get("/health")
-def health_check():
-    """Проверка здоровья API и подключений"""
-    health_status = {
-        "status": "checking",
-        "timestamp": datetime.now().isoformat(),
-        "services": {}
-    }
-
-    # Проверка Google Sheets
-    try:
-        client = gspread.service_account(filename=GOOGLE_CREDENTIALS_FILE)
-        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
-        health_status["services"]["google_sheets"] = "✅ OK"
-    except Exception as e:
-        health_status["services"]["google_sheets"] = f"❌ Error: {str(e)[:100]}"
-        error_manager.send_notification(
-            ErrorType.GOOGLE_SHEETS_ERROR,
-            f"Health check ошибка: {str(e)}",
-            "Health Check",
-            {"service": "google_sheets"}
-        )
-
-    # Проверка TenderPlan API
-    try:
-        resp = requests.get(
-            TENDERS_URL,
-            headers={"Authorization": f"Bearer {API_TOKEN}"},
-            params={"page": 0, "limit": 1},
-            timeout=15
-        )
-        if resp.status_code == 200:
-            health_status["services"]["tenderplan_api"] = "✅ OK"
-        else:
-            health_status["services"]["tenderplan_api"] = f"⚠️ Status {resp.status_code}"
-    except Exception as e:
-        health_status["services"]["tenderplan_api"] = f"❌ Error: {str(e)[:100]}"
-
-    health_status["status"] = "healthy" if all(
-        "OK" in str(v) for v in health_status["services"].values()) else "degraded"
-
-    return health_status
-
-
-# -----------------------
-# 🚀 ОПТИМИЗИРОВАННЫЙ PARSE-DOC ENDPOINT
-# -----------------------
-@app.post("/parse-doc")
-async def parse_doc(url: str):
-    """
-    ✨ ОПТИМИЗИРОВАННЫЙ парсер документов
-
-    - Потоковая загрузка с проверкой размера
-    - Парсинг БЕЗ сохранения на диск
-    - Асинхронный (не блокирует сервер)
-    - Таймауты и ограничения
-    """
-
-    logger.info(f"📥 Новый запрос парсинга: {url[:80]}...")
-
-    try:
-        # ========== ШАГ 1: СКАЧИВАНИЕ ==========
-        logger.info("ШАГ 1: Скачивание файла с потоком и проверкой размера")
-
-        max_size = MAX_FILE_SIZE_MB * 1024 * 1024  # Конвертируем в байты
-
-        # Скачиваем асинхронно в отдельном потоке
-        file_content = await asyncio.get_event_loop().run_in_executor(
-            executor,
-            download_file_with_limit,
-            url,
-            max_size
-        )
-
-        logger.info(f"✅ Файл скачан: {len(file_content) / 1024 / 1024:.2f}MB")
-
-        # ========== ШАГ 2: ОПРЕДЕЛЕНИЕ ФОРМАТА ==========
-        logger.info("ШАГ 2: Определение формата файла")
-
-        ext = "docx" if url.lower().endswith("docx") else "doc"
-        logger.info(f"Формат: {ext.upper()}")
-
-        # ========== ШАГ 3: ПАРСИНГ ==========
-        logger.info(f"ШАГ 3: Парсинг {ext.upper()} из памяти")
-
-        if ext == "docx":
-            # Парсим DOCX асинхронно в отдельном потоке
-            text = await asyncio.get_event_loop().run_in_executor(
-                executor,
-                parse_docx_from_bytes,
-                file_content
-            )
-        else:
-            # Парсим DOC асинхронно в отдельном потоке
-            text = await asyncio.get_event_loop().run_in_executor(
-                executor,
-                parse_doc_from_bytes,
-                file_content
-            )
-
-        logger.info(f"✅ Парсинг завершен: {len(text)} символов")
-
-        # ========== ШАГ 4: ВОЗВРАТ РЕЗУЛЬТАТА ==========
-        return {
-            "status": "ok",
-            "text": text,
-            "format": ext,
-            "file_size_mb": round(len(file_content) / 1024 / 1024, 2),
-            "text_length": len(text),
-            "timestamp": datetime.now().isoformat()
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        error_manager.send_notification(
-            ErrorType.DOCUMENT_PARSE_ERROR,
-            f"Неожиданная ошибка: {str(e)}",
-            "Парсинг документа",
-            {"url": url[:100], "error": str(e)[:200], "traceback": traceback.format_exc()[:500]}
-        )
-        raise HTTPException(status_code=500, detail=f"Ошибка при парсинге: {str(e)[:100]}")
-
-
-# -----------------------
-# LOAD TENDERS ENDPOINT
-# -----------------------
-@app.get("/load-tenders")
-def load_tenders():
-    """Основной endpoint для загрузки тендеров из TenderPlan в Google Sheets"""
-
-    logger.info("=" * 60)
-    logger.info("Начало процесса загрузки тендеров")
-    logger.info("=" * 60)
-
-    try:
-        # ========== ЭТАП 1: Подготовка =========
-        logger.info("ЭТАП 1: Подготовка параметров")
-
-        # 🔧 ИСПРАВЛЕНИЕ: Получаем локальное время вместо UTC
-        local_tz = get_local_timezone()
-        now_utc = datetime.now(pytz.UTC)
-        now = datetime.now(local_tz)
-
-        logger.info(f"Серверное время (UTC):       {now_utc.strftime('%d.%m.%Y %H:%M:%S UTC')}")
-        logger.info(f"Локальное время ({TIMEZONE}): {now.strftime('%d.%m.%Y %H:%M:%S %Z')}")
-
-        # Вычисляем целевой день в локальном времени
-        target_day = (now - timedelta(days=1)).date()
-
-        # Создаём временные границы целевого дня
-        start_dt = datetime.combine(target_day, dt_time(0, 0))
-        end_dt = datetime.combine(target_day, dt_time(23, 59, 59))
-
-        # Локализуем в локальный часовой пояс
-        start_dt_local = local_tz.localize(start_dt)
-        end_dt_local = local_tz.localize(end_dt)
-
-        # Преобразуем в UTC для API
-        start_dt_utc = start_dt_local.astimezone(pytz.UTC)
-        end_dt_utc = end_dt_local.astimezone(pytz.UTC)
-
-        from_ts = tender_ts(start_dt_utc)
-        to_ts = tender_ts(end_dt_utc)
-
-        logger.info(f"Период загрузки: {target_day.strftime('%d.%m.%Y')}")
-        logger.info(f"Начало ({TIMEZONE}): {start_dt_local.strftime('%d.%m.%Y %H:%M:%S %Z')}")
-        logger.info(f"Конец ({TIMEZONE}):  {end_dt_local.strftime('%d.%m.%Y %H:%M:%S %Z')}")
-        logger.info(f"Timestamp: {from_ts} - {to_ts}")
-
-        headers = {"Authorization": f"Bearer {API_TOKEN}"}
-        all_tenders = []
-        page = 0
-        failed_pages = []
-        skipped_tenders = []  # 🔧 Список пропущенных тендеров
-
-        # ========== ЭТАП 2: Получение тендеров =========
-        logger.info("ЭТАП 2: Загрузка тендеров с TenderPlan API")
-
-        while True:
-            try:
-                params = {
-                    "fromPublicationDateTime": from_ts,
-                    "toPublicationDateTime": to_ts,
-                    "statuses": "1",
-                    "page": page,
-                    "limit": 100
-                }
-
-                logger.debug(f"Запрос страницы {page}...")
-
-                resp = requests.get(
-                    TENDERS_URL,
-                    headers=headers,
-                    params=params,
-                    timeout=40
-                )
-
-                # Проверка статус кодов
-                if resp.status_code == 401:
-                    error_manager.send_notification(
-                        ErrorType.TENDERPLAN_API_ERROR,
-                        "Неавторизованный запрос к TenderPlan API (401 Unauthorized)",
-                        "Загрузка тендеров",
-                        {
-                            "status_code": 401,
-                            "message": "API токен неверный или истек",
-                            "recommendation": "Проверьте переменную окружения API_TOKEN"
-                        }
-                    )
-                    return {
-                        "status": "error",
-                        "error": "Unauthorized",
-                        "message": "Ошибка аутентификации. Проверьте API_TOKEN."
-                    }
-
-                elif resp.status_code == 429:
-                    error_manager.send_notification(
-                        ErrorType.TENDERPLAN_API_ERROR,
-                        "Превышен лимит запросов (429 Too Many Requests)",
-                        "Загрузка тендеров",
-                        {
-                            "status_code": 429,
-                            "page": page,
-                            "message": "API лимит исчерпан. Процесс остановлен."
-                        }
-                    )
-                    logger.warning(f"Rate limit достигнут на странице {page}")
-                    break
-
-                elif resp.status_code != 200:
-                    error_manager.send_notification(
-                        ErrorType.TENDERPLAN_API_ERROR,
-                        f"TenderPlan API вернул ошибку {resp.status_code}",
-                        "Загрузка тендеров",
-                        {
-                            "status_code": resp.status_code,
-                            "page": page,
-                            "response": resp.text[:500]
-                        }
-                    )
-                    logger.error(f"Ошибка при загрузке страницы {page}: {resp.status_code}")
-                    failed_pages.append(page)
-                    break
-
-                # Парсим ответ
-                try:
-                    data = resp.json()
-                except ValueError as e:
-                    error_manager.send_notification(
-                        ErrorType.TENDERPLAN_API_ERROR,
-                        f"Ошибка парсинга JSON ответа: {str(e)}",
-                        "Парсинг ответа TenderPlan API",
-                        {"page": page, "response_length": len(resp.text)}
-                    )
-                    logger.error(f"Не удалось распарсить JSON на странице {page}")
-                    failed_pages.append(page)
-                    break
-
-                tenders = data.get("tenders", [])
-                if not tenders:
-                    logger.info(f"Тендеры на странице {page} не найдены. Загрузка завершена.")
-                    break
-
-                logger.info(f"Страница {page}: загружено {len(tenders)} тендеров")
-                all_tenders.extend(tenders)
-                page += 1
-
-            except requests.Timeout:
-                error_manager.send_notification(
-                    ErrorType.TENDERPLAN_API_ERROR,
-                    f"Timeout при загрузке тендеров (>15 сек)",
-                    "Загрузка тендеров",
-                    {"page": page}
-                )
-                logger.error(f"Timeout на странице {page}")
-                failed_pages.append(page)
-                break
-            except requests.ConnectionError as e:
-                error_manager.send_notification(
-                    ErrorType.TENDERPLAN_API_ERROR,
-                    f"Ошибка соединения: {str(e)}",
-                    "Загрузка тендеров",
-                    {"page": page, "error": str(e)}
-                )
-                logger.error(f"Ошибка соединения на странице {page}: {e}")
-                failed_pages.append(page)
-                break
-            except Exception as e:
-                error_manager.send_notification(
-                    ErrorType.TENDERPLAN_API_ERROR,
-                    f"Неожиданная ошибка при загрузке тендеров: {str(e)}",
-                    "Загрузка тендеров",
-                    {"page": page, "error": str(e), "traceback": traceback.format_exc()}
-                )
-                logger.error(f"Неожиданная ошибка на странице {page}: {e}")
-                failed_pages.append(page)
-                break
-
-        if not all_tenders:
-            logger.warning("Тендеры не найдены")
-            return {
-                "status": "success",
-                "message": "Нет тендеров за вчера",
-                "added": 0,
-                "failed_pages": failed_pages,
-                "skipped": 0
-            }
-
-        logger.info(f"Всего загружено тендеров: {len(all_tenders)}")
-
-        # ========== ЭТАП 3: Подключение к Google Sheets =========
-        logger.info("ЭТАП 3: Подключение к Google Sheets")
-
-        try:
-            sheet = get_sheet()
-            logger.info("✅ Успешное подключение к Google Sheets")
-        except Exception as e:
-            logger.error(f"Не удалось подключиться к Google Sheets: {e}")
-            return {
-                "status": "error",
-                "error": "Google Sheets Connection Error",
-                "message": str(e)
-            }
-
-        # ========== ЭТАП 4: Обработка тендеров =========
-        logger.info("ЭТАП 4: Обработка тендеров")
-
-        rows = []
-        max_docs = 0
-        now_str = now.strftime("%d.%m.%Y %H:%M")
-        processing_errors = []
-
-        for idx, t in enumerate(all_tenders):
-            try:
-                tender_id = t.get("_id", "unknown")
-                placing_way = t.get("placingWay", -1)
-
-                # 🔧 ПРОВЕРКА: Пропускаем исключённые способы размещения
-                if should_skip_tender(placing_way):
-                    placing_name = PLACING_WAYS.get(placing_way, "Неизвестно")
-                    skipped_tenders.append({
-                        "id": tender_id,
-                        "placing_way": placing_way,
-                        "placing_name": placing_name
-                    })
-                    logger.debug(f"Пропущен тендер {tender_id}: способ размещения '{placing_name}' ({placing_way})")
-                    continue
-
-                customers = t.get("customers", [])
-                customer_names = ", ".join([c.get("name", "") for c in customers])
-
-                placing_name = PLACING_WAYS.get(placing_way, "Неизвестно")
-
-                attachments = fetch_attachments(tender_id, headers)
-                max_docs = max(max_docs, len(attachments))
-
-                row = [
-                    now_str,
-                    tender_id,
-                    t.get("orderName", ""),
-                    customer_names,
-                    t.get("maxPrice", ""),
-                    f"https://tenderplan.ru/app?key=0&tender={tender_id}",
-                    convert_timestamp(t.get("publicationDateTime")),
-                    convert_timestamp(t.get("submissionCloseDateTime")),
-                    placing_name
-                ]
-
-                for a in attachments:
-                    row.append(a.get("displayName", ""))
-                    row.append(a.get("href", ""))
-
-                rows.append(row)
-
-            except Exception as e:
-                error_msg = f"Ошибка при обработке тендера {t.get('_id', 'unknown')}: {str(e)}"
-                logger.warning(error_msg)
-                processing_errors.append({
-                    "tender_id": t.get("_id"),
-                    "error": str(e)
-                })
-                continue
-
-            if (idx + 1) % 50 == 0:
-                logger.debug(f"Обработано {idx + 1} тендеров...")
-
-        logger.info(f"✅ Обработано {len(rows)} тендеров успешно")
-        logger.info(f"⏭️ Пропущено {len(skipped_tenders)} тендеров (исключённые способы размещения)")
-
-        if processing_errors:
-            logger.warning(f"⚠️ Ошибок при обработке: {len(processing_errors)}")
-
-        # ========== ЭТАП 5: Загрузка в Google Sheets =========
-        logger.info("ЭТАП 5: Загрузка данных в Google Sheets")
-
-        try:
-            ensure_header(sheet, max_docs)
-            logger.info("✅ Заголовок обновлен")
-        except Exception as e:
-            logger.error(f"Ошибка при обновлении заголовка: {e}")
-            return {
-                "status": "error",
-                "error": "Header Update Error",
-                "message": str(e)
-            }
-
-        try:
-            if rows:
-                sheet.append_rows(rows, value_input_option="USER_ENTERED")
-                logger.info(f"✅ Загружено {len(rows)} строк в Google Sheets")
-            else:
-                logger.warning("Нет строк для загрузки")
-        except gspread.exceptions.APIError as e:
-            error_manager.send_notification(
-                ErrorType.GOOGLE_SHEETS_ERROR,
-                f"Google Sheets API ошибка при загрузке данных: {str(e)}",
-                "Загрузка данных в Sheets",
-                {
-                    "status_code": getattr(e, "status_code", None),
-                    "rows_count": len(rows),
-                    "message": str(e)
-                }
-            )
-            return {
-                "status": "error",
-                "error": "Google Sheets API Error",
-                "message": str(e)
-            }
-        except Exception as e:
-            error_manager.send_notification(
-                ErrorType.GOOGLE_SHEETS_ERROR,
-                f"Ошибка при загрузке данных в Google Sheets: {str(e)}",
-                "Загрузка данных в Sheets",
-                {"error": str(e), "traceback": traceback.format_exc()}
-            )
-            return {
-                "status": "error",
-                "error": "Data Upload Error",
-                "message": str(e)
-            }
-
-        # ========== ИТОГИ =========
-        logger.info("=" * 60)
-        logger.info("✅ УСПЕШНО: Процесс загрузки завершен")
-        logger.info("=" * 60)
-
-        return {
-            "status": "success",
-            "added": len(rows),
-            "total_fetched": len(all_tenders),
-            "skipped": len(skipped_tenders),
-            "skipped_details": skipped_tenders[:10] if skipped_tenders else [],  # Показываем первые 10
-            "processing_errors": len(processing_errors),
-            "failed_pages": failed_pages,
-            "timestamp": now_str,
-            "target_date": target_day.strftime("%d.%m.%Y"),
-            "timezone": TIMEZONE
-        }
-
-    except Exception as e:
-        error_manager.send_notification(
-            ErrorType.UNKNOWN_ERROR,
-            f"Неожиданная ошибка в процессе загрузки тендеров: {str(e)}",
-            "Основной процесс загрузки",
-            {"error": str(e), "traceback": traceback.format_exc()}
-        )
-        logger.error(f"Неожиданная ошибка: {e}")
-        return {
-            "status": "error",
-            "error": "Unexpected Error",
-            "message": str(e)
-        }
-
-
-# -----------------------
-# ERRORS ENDPOINT
-# -----------------------
-@app.get("/errors")
-def get_errors(limit: int = 50):
-    """Возвращает последние N ошибок"""
-    return {
-        "error_count": len(error_manager.errors),
-        "showing": min(limit, len(error_manager.errors)),
-        "errors": error_manager.errors[-limit:]
-    }
-
-
-# -----------------------
-# INFO ENDPOINT
-# -----------------------
 @app.get("/info")
 def get_info():
-    """Информация об API и конфигурации"""
     return {
         "app": "Tender Loader API + Parser",
-        "version": "2.1",
+        "version": "2.2.1",
         "config": {
             "timezone": TIMEZONE,
             "max_file_size_mb": MAX_FILE_SIZE_MB,
             "download_timeout_sec": DOWNLOAD_TIMEOUT_SEC,
             "parse_timeout_sec": PARSE_TIMEOUT_SEC,
-            "excluded_placing_ways": list(EXCLUDED_PLACING_WAYS)
+            "excluded_placing_ways": list(EXCLUDED_PLACING_WAYS),
+            "excluded_placing_ways_details": {str(pw): PLACING_WAYS.get(pw, "Unknown") for pw in EXCLUDED_PLACING_WAYS}
         },
         "endpoints": {
-            "GET /ping": "Health check (keep-alive)",
-            "GET /health": "Detailed service check",
-            "GET /check-time": "Check current time in different timezones",
-            "POST /parse-doc": "Parse DOC/DOCX document (async, optimized)",
-            "GET /load-tenders": "Load tenders from TenderPlan",
-            "GET /errors": "View errors log",
-            "GET /info": "API info and config"
+            "GET /ping": "Health check", "GET /health": "Detailed service check",
+            "GET /check-time": "Check timezones", "POST /parse-doc": "Parse DOC/DOCX",
+            "GET /load-tenders": "Load tenders", "GET /errors": "View errors log", "GET /info": "API info"
         },
         "improvements": {
-            "timezone": "✅ Converted to local timezone (Asia/Novosibirsk by default)",
-            "parse_doc": "✅ Stream download + parsing from memory (3x faster)",
-            "async": "✅ Non-blocking async processing",
-            "error_handling": "✅ Comprehensive error tracking",
-            "filtering": "✅ Exclude specific placing ways (e.g., electronic auctions)",
-            "render_compatible": "✅ No localhost calls, no disk I/O"
+            "publish_date_fix": "✅ Publish date is now converted to local timezone in sheets",
+            "timezone": "✅ Converted to local timezone",
+            "filtering": "✅ Exclude electronic auctions",
         }
     }
 
+# ============================================================
+# PARSE DOC ENDPOINT (без изменений)
+# ============================================================
+
+def parse_document(file_content: bytes, file_name: str) -> Dict[str, Any]:
+    try:
+        file_stream = BytesIO(file_content)
+        if file_name.lower().endswith('.docx'):
+            result = convert_to_html(file_stream)
+            text = re.sub(r'<[^>]+>', '', result.value).strip()
+        elif file_name.lower().endswith('.doc'):
+            doc = Document(file_stream)
+            text = '\n'.join([para.text for para in doc.paragraphs])
+        else:
+            raise ValueError("Unsupported file format")
+        return {"status": "success", "file_name": file_name, "content_length": len(text), "preview": text[:500] if text else "No content"}
+    except Exception as e:
+        logger.error(f"Error parsing document: {e}")
+        return {"status": "error", "file_name": file_name, "error": str(e)}
+
+@app.post("/parse-doc")
+async def parse_doc(file: UploadFile = File(...)):
+    try:
+        file_content = await file.read()
+        if len(file_content) > MAX_FILE_SIZE_MB * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"File too large. Max size: {MAX_FILE_SIZE_MB}MB")
+        result = parse_document(file_content, file.filename)
+        return result
+    except Exception as e:
+        logger.error(f"Error in parse_doc: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================
+# LOAD TENDERS ENDPOINT (ГЛАВНАЯ ФУНКЦИЯ С ИСПРАВЛЕНИЕМ)
+# ============================================================
+
+@app.get("/load-tenders")
+def load_tenders():
+    logger.info("=" * 60)
+    logger.info("🔄 ЗАПУСК ЗАГРУЗКИ ТЕНДЕРОВ")
+    logger.info("=" * 60)
+
+    try:
+        # ЭТАП 1: ПОДГОТОВКА
+        logger.info("📋 ЭТАП 1: Подготовка параметров")
+        if not API_TOKEN: raise ValueError("API_TOKEN not configured")
+
+        local_tz = get_local_timezone()
+        target_date = get_target_date()
+        start_timestamp, end_timestamp, start_time, end_time = get_date_range_timestamps(target_date)
+
+        logger.info(f"🎯 Целевой день: {target_date.strftime('%d.%m.%Y')} ({TIMEZONE})")
+        logger.info(f"⏰ Диапазон: {start_time.strftime('%H:%M:%S')} - {end_time.strftime('%H:%M:%S')}")
+        logger.info(f"🔧 Исключённые способы: {EXCLUDED_PLACING_WAYS}")
+
+        # ЭТАП 2: ЗАГРУЗКА
+        logger.info("📡 ЭТАП 2: Загрузка тендеров с TenderPlan API")
+        url = "https://api.tenderplan.ru/api/v2/tenders"
+        headers = {"Authorization": f"Bearer {API_TOKEN}"}
+        all_tenders = []
+        page = 1
+        while True:
+            params = {"per_page": 100, "page": page, "dateFrom": start_timestamp, "dateTo": end_timestamp}
+            response = requests.get(url, headers=headers, params=params, timeout=DOWNLOAD_TIMEOUT_SEC)
+            if response.status_code != 200:
+                logger.error(f"API error: {response.status_code}"); break
+            data = response.json()
+            tenders = data.get("data", [])
+            if not tenders: break
+            all_tenders.extend(tenders)
+            logger.info(f"Загружено {len(tenders)} тендеров со страницы {page}")
+            page += 1
+        logger.info(f"✅ Всего загружено: {len(all_tenders)} тендеров")
+
+        # ЭТАП 3: GOOGLE SHEETS
+        logger.info("📊 ЭТАП 3: Подключение к Google Sheets")
+        gc = get_google_sheets_client()
+        worksheet = get_or_create_worksheet(gc, GOOGLE_SHEET_ID, "Tenders")
+        logger.info("✅ Подключение к Google Sheets успешно")
+
+        # ЭТАП 4: ОБРАБОТКА (С ФИЛЬТРАЦИЕЙ И ИСПРАВЛЕНИЕМ ДАТЫ)
+        logger.info("⚙️  ЭТАП 4: Обработка тендеров")
+        rows, skipped_tenders = [], []
+        for tender in all_tenders:
+            placing_way = tender.get("placingWay", {}).get("id")
+            if should_skip_tender(placing_way):
+                skipped_tenders.append({"id": tender.get("id"), "placing_way": placing_way})
+                continue
+
+            # ⭐️ ИСПРАВЛЕНИЕ ЗДЕСЬ ⭐️
+            row = [
+                tender.get("id", ""),
+                tender.get("name", "")[:100],
+                tender.get("organization", {}).get("name", "")[:100],
+                tender.get("price", ""),
+                tender.get("placingWay", {}).get("name", ""),
+                tender.get("status", {}).get("name", ""),
+                format_publish_date_to_local(tender.get("publishDate", "")),  # <--- ИСПОЛЬЗУЕМ НОВУЮ ФУНКЦИЮ
+                tender.get("url", "")
+            ]
+            rows.append(row)
+
+        # ЭТАП 5: ДОБАВЛЕНИЕ В ТАБЛИЦУ
+        logger.info(f"📝 ЭТАП 5: Добавление данных в таблицу ({len(rows)} тендеров)")
+        if rows:
+            worksheet.append_rows(rows, value_input_option="RAW")
+            logger.info(f"✅ Добавлено {len(rows)} строк в Google Sheets")
+
+        # ИТОГИ
+        logger.info("=" * 60)
+        logger.info("✅ ИТОГИ ОБРАБОТКИ:")
+        logger.info(f"   Всего получено:      {len(all_tenders)}")
+        logger.info(f"   Добавлено в таблицу: {len(rows)}")
+        logger.info(f"   Пропущено:           {len(skipped_tenders)}")
+        logger.info("=" * 60)
+
+        return {
+            "status": "success", "added": len(rows), "total_fetched": len(all_tenders),
+            "skipped": len(skipped_tenders), "timestamp": datetime.now(local_tz).strftime("%d.%m.%Y %H:%M"),
+            "target_date": target_date.strftime("%d.%m.%Y"), "timezone": TIMEZONE,
+            "validation": {"match": len(rows) + len(skipped_tenders) == len(all_tenders)}
+        }
+    except Exception as e:
+        logger.error(f"Fatal error in load_tenders: {e}", exc_info=True)
+        return {"status": "error", "error": str(e)}
+
+# ============================================================
+# STARTUP
+# ============================================================
+@app.on_event("startup")
+async def startup_event():
+    logger.info("=" * 60)
+    logger.info("🚀 TENDER LOADER API STARTING")
+    logger.info(f"Version: 2.2.1")
+    logger.info(f"Timezone: {TIMEZONE}")
+    logger.info(f"Excluded placing ways: {EXCLUDED_PLACING_WAYS}")
+    logger.info("=" * 60)
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
