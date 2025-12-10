@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 import requests
 from datetime import datetime, timedelta, time as dt_time
+import pytz  # 🔧 ДОБАВЛЕНО ДЛЯ РАБОТЫ С ЧАСОВЫМИ ПОЯСАМИ
 import gspread
 from dotenv import load_dotenv
 from tempfile import NamedTemporaryFile
@@ -15,7 +16,6 @@ from enum import Enum
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import io
-import pytz  # ✅ ДОБАВИЛИ PYTZ
 
 # -----------------------
 # Загружаем настройки
@@ -26,16 +26,12 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDS_B64 = os.getenv("GOOGLE_CREDS_B64")
 
 # Новые переменные для оптимизации
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "100"))
-DOWNLOAD_TIMEOUT_SEC = int(os.getenv("DOWNLOAD_TIMEOUT_SEC", "120"))
-PARSE_TIMEOUT_SEC = int(os.getenv("PARSE_TIMEOUT_SEC", "60"))
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "100"))  # Макс размер файла 100MB
+DOWNLOAD_TIMEOUT_SEC = int(os.getenv("DOWNLOAD_TIMEOUT_SEC", "120"))  # 2 минуты на скачивание
+PARSE_TIMEOUT_SEC = int(os.getenv("PARSE_TIMEOUT_SEC", "60"))  # 1 минута на парсинг
 
-# -----------------------
-# ✅ ВРЕМЕННЫЕ ЗОНЫ
-# -----------------------
-UTC_TZ = pytz.UTC
-MSK_TZ = pytz.timezone('Europe/Moscow')  # UTC+3 (где публикуются тендеры)
-NSK_TZ = pytz.timezone('Asia/Novosibirsk')  # UTC+7 (где запускается скрипт)
+# 🔧 ЧАСОВОЙ ПОЯС ДЛЯ РАБОТЫ
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Novosibirsk")
 
 # -----------------------
 # Создание service_account.json из Base64 (для Render)
@@ -125,6 +121,9 @@ PLACING_WAYS = {
     29: "Публичное предложение", 30: "Закупки малого объема"
 }
 
+# 🔧 СПОСОБЫ, КОТОРЫЕ НЕ ЗАГРУЖАЕМ В ТАБЛИЦУ
+EXCLUDED_PLACING_WAYS = {15}  # 15: "Электронный аукцион"
+
 
 # -----------------------
 # Вспомогательные функции
@@ -143,6 +142,16 @@ def convert_timestamp(ts):
             logger.warning(f"Ошибка конвертации timestamp {ts}: {e}")
             return ""
     return ""
+
+
+def should_skip_tender(placing_way: int) -> bool:
+    """Проверяет, нужно ли пропустить тендер"""
+    return placing_way in EXCLUDED_PLACING_WAYS
+
+
+def get_local_timezone():
+    """Возвращает объект часового пояса"""
+    return pytz.timezone(TIMEZONE)
 
 
 def get_sheet():
@@ -344,10 +353,11 @@ def download_file_with_limit(url: str, max_size_bytes: int) -> bytes:
         with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT_SEC) as resp:
             resp.raise_for_status()
 
-            for chunk in resp.iter_content(chunk_size=8192):
+            for chunk in resp.iter_content(chunk_size=8192):  # 8KB chunks
                 if chunk:
                     downloaded_size += len(chunk)
 
+                    # Проверяем, не превышен ли лимит
                     if downloaded_size > max_size_bytes:
                         error_msg = f"Скачанный файл превышает лимит: {downloaded_size} > {max_size_bytes}"
                         error_manager.send_notification(
@@ -360,6 +370,7 @@ def download_file_with_limit(url: str, max_size_bytes: int) -> bytes:
 
                     chunks.append(chunk)
 
+                    # Логируем прогресс каждые 10MB
                     if downloaded_size % (10 * 1024 * 1024) == 0:
                         logger.debug(f"Загружено: {downloaded_size / 1024 / 1024:.1f}MB")
 
@@ -423,6 +434,7 @@ def parse_docx_from_bytes(file_bytes: bytes) -> str:
     try:
         logger.info(f"Начало парсинга DOCX из памяти ({len(file_bytes)} байт)")
 
+        # Парсим прямо из памяти используя BytesIO
         doc = docx.Document(io.BytesIO(file_bytes))
         full_text = "\n".join(p.text for p in doc.paragraphs).strip()
 
@@ -461,6 +473,7 @@ def parse_doc_from_bytes(file_bytes: bytes) -> str:
     try:
         logger.info(f"Начало парсинга DOC из памяти ({len(file_bytes)} байт)")
 
+        # Парсим прямо из памяти используя BytesIO
         result = mammoth.extract_raw_text(io.BytesIO(file_bytes))
         text = result.value.strip()
 
@@ -481,70 +494,6 @@ def parse_doc_from_bytes(file_bytes: bytes) -> str:
 
 
 # -----------------------
-# ✅ TEST TIMEZONE ENDPOINT (для отладки)
-# -----------------------
-@app.get("/test-timezone")
-def test_timezone():
-    """
-    Endpoint для теста правильности работы с временными зонами
-    Показывает текущее время во всех временных зонах
-    """
-    try:
-        # Получаем текущее UTC время
-        now_utc = datetime.now(UTC_TZ)
-
-        # Конвертируем в разные зоны
-        now_msk = now_utc.astimezone(MSK_TZ)
-        now_nsk = now_utc.astimezone(NSK_TZ)
-
-        # Вчера по новосибирскому времени
-        target_day_nsk = (now_nsk - timedelta(days=1)).date()
-
-        # Начало и конец дня в Новосибирске
-        start_nsk = NSK_TZ.localize(datetime.combine(target_day_nsk, dt_time(0, 0)))
-        end_nsk = NSK_TZ.localize(datetime.combine(target_day_nsk, dt_time(23, 59, 59)))
-
-        # Конвертируем в Москву
-        start_msk = start_nsk.astimezone(MSK_TZ)
-        end_msk = end_nsk.astimezone(MSK_TZ)
-
-        # Конвертируем в UTC для API
-        start_utc = start_msk.astimezone(UTC_TZ)
-        end_utc = end_msk.astimezone(UTC_TZ)
-
-        return {
-            "status": "ok",
-            "server_info": {
-                "server_timezone": "UTC (Render by default)",
-                "timestamp": datetime.now().isoformat()
-            },
-            "current_time": {
-                "utc": now_utc.strftime('%d.%m.%Y %H:%M:%S %Z'),
-                "moscow": now_msk.strftime('%d.%m.%Y %H:%M:%S %Z'),
-                "novosibirsk": now_nsk.strftime('%d.%m.%Y %H:%M:%S %Z')
-            },
-            "tender_query_params": {
-                "description": "Параметры для запроса тендеров за ВЧЕРА (по Новосибирску)",
-                "target_day_nsk": target_day_nsk.strftime('%d.%m.%Y'),
-                "start_nsk": start_nsk.strftime('%d.%m.%Y %H:%M:%S %Z'),
-                "end_nsk": end_nsk.strftime('%d.%m.%Y %H:%M:%S %Z'),
-                "start_msk": start_msk.strftime('%d.%m.%Y %H:%M:%S %Z (публикация тендеров)'),
-                "end_msk": end_msk.strftime('%d.%m.%Y %H:%M:%S %Z (публикация тендеров)'),
-                "start_utc_for_api": start_utc.strftime('%d.%m.%Y %H:%M:%S %Z'),
-                "end_utc_for_api": end_utc.strftime('%d.%m.%Y %H:%M:%S %Z'),
-                "from_ts": tender_ts(start_utc.replace(tzinfo=None)),
-                "to_ts": tender_ts(end_utc.replace(tzinfo=None))
-            }
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e),
-            "traceback": traceback.format_exc()
-        }
-
-
-# -----------------------
 # ✅ PING ENDPOINT (KEEP-ALIVE)
 # -----------------------
 @app.get("/ping")
@@ -554,7 +503,7 @@ def ping():
         return {
             "status": "ok",
             "message": "API is alive and running",
-            "timestamp": datetime.now(UTC_TZ).isoformat(),
+            "timestamp": datetime.now().isoformat(),
             "uptime_check": "Render will keep this instance active with periodic pings"
         }
     except Exception as e:
@@ -567,7 +516,72 @@ def ping():
         return {
             "status": "error",
             "message": f"Ping failed: {str(e)}",
-            "timestamp": datetime.now(UTC_TZ).isoformat()
+            "timestamp": datetime.now().isoformat()
+        }
+
+
+# -----------------------
+# 🔧 ENDPOINT ДЛЯ ПРОВЕРКИ ВРЕМЕНИ
+# -----------------------
+@app.get("/check-time")
+def check_time():
+    """Проверка текущего времени в разных часовых поясах"""
+    try:
+        local_tz = get_local_timezone()
+
+        now_utc = datetime.now(pytz.UTC)
+        now_local = datetime.now(local_tz)
+        now_system = datetime.now()
+
+        # Вычисляем целевой день для загрузки
+        target_day = (now_local - timedelta(days=1)).date()
+
+        start_dt = datetime.combine(target_day, dt_time(0, 0))
+        end_dt = datetime.combine(target_day, dt_time(23, 59, 59))
+
+        start_dt_local = local_tz.localize(start_dt)
+        end_dt_local = local_tz.localize(end_dt)
+
+        start_dt_utc = start_dt_local.astimezone(pytz.UTC)
+        end_dt_utc = end_dt_local.astimezone(pytz.UTC)
+
+        from_ts = tender_ts(start_dt_utc)
+        to_ts = tender_ts(end_dt_utc)
+
+        return {
+            "status": "ok",
+            "timezone": TIMEZONE,
+            "current_time": {
+                "system": now_system.strftime('%d.%m.%Y %H:%M:%S'),
+                "utc": now_utc.strftime('%d.%m.%Y %H:%M:%S UTC'),
+                "local": now_local.strftime('%d.%m.%Y %H:%M:%S %Z (UTC%z)')
+            },
+            "target_date": {
+                "date": target_day.strftime('%d.%m.%Y'),
+                "start": {
+                    "local": start_dt_local.strftime('%d.%m.%Y %H:%M:%S %Z'),
+                    "utc": start_dt_utc.strftime('%d.%m.%Y %H:%M:%S UTC'),
+                    "timestamp": from_ts
+                },
+                "end": {
+                    "local": end_dt_local.strftime('%d.%m.%Y %H:%M:%S %Z'),
+                    "utc": end_dt_utc.strftime('%d.%m.%Y %H:%M:%S UTC'),
+                    "timestamp": to_ts
+                }
+            },
+            "message": f"Будут загружены тендеры за {target_day.strftime('%d.%m.%Y')} (вчерашний день в {TIMEZONE})"
+        }
+    except Exception as e:
+        error_manager.send_notification(
+            ErrorType.UNKNOWN_ERROR,
+            f"Ошибка при проверке времени: {str(e)}",
+            "Check Time Endpoint",
+            {"error": str(e), "traceback": traceback.format_exc()}
+        )
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
         }
 
 
@@ -579,7 +593,7 @@ def health_check():
     """Проверка здоровья API и подключений"""
     health_status = {
         "status": "checking",
-        "timestamp": datetime.now(UTC_TZ).isoformat(),
+        "timestamp": datetime.now().isoformat(),
         "services": {}
     }
 
@@ -638,8 +652,9 @@ async def parse_doc(url: str):
         # ========== ШАГ 1: СКАЧИВАНИЕ ==========
         logger.info("ШАГ 1: Скачивание файла с потоком и проверкой размера")
 
-        max_size = MAX_FILE_SIZE_MB * 1024 * 1024
+        max_size = MAX_FILE_SIZE_MB * 1024 * 1024  # Конвертируем в байты
 
+        # Скачиваем асинхронно в отдельном потоке
         file_content = await asyncio.get_event_loop().run_in_executor(
             executor,
             download_file_with_limit,
@@ -659,12 +674,14 @@ async def parse_doc(url: str):
         logger.info(f"ШАГ 3: Парсинг {ext.upper()} из памяти")
 
         if ext == "docx":
+            # Парсим DOCX асинхронно в отдельном потоке
             text = await asyncio.get_event_loop().run_in_executor(
                 executor,
                 parse_docx_from_bytes,
                 file_content
             )
         else:
+            # Парсим DOC асинхронно в отдельном потоке
             text = await asyncio.get_event_loop().run_in_executor(
                 executor,
                 parse_doc_from_bytes,
@@ -680,7 +697,7 @@ async def parse_doc(url: str):
             "format": ext,
             "file_size_mb": round(len(file_content) / 1024 / 1024, 2),
             "text_length": len(text),
-            "timestamp": datetime.now(UTC_TZ).isoformat()
+            "timestamp": datetime.now().isoformat()
         }
 
     except HTTPException:
@@ -697,7 +714,7 @@ async def parse_doc(url: str):
 
 
 # -----------------------
-# LOAD TENDERS ENDPOINT ✅ ИСПРАВЛЕННЫЙ
+# LOAD TENDERS ENDPOINT
 # -----------------------
 @app.get("/load-tenders")
 def load_tenders():
@@ -711,35 +728,42 @@ def load_tenders():
         # ========== ЭТАП 1: Подготовка =========
         logger.info("ЭТАП 1: Подготовка параметров")
 
-        # ✅ ИСПРАВЛЕННЫЙ КОД - используем правильные временные зоны
-        now_utc = datetime.now(UTC_TZ)
-        now_nsk = now_utc.astimezone(NSK_TZ)
+        # 🔧 ИСПРАВЛЕНИЕ: Получаем локальное время вместо UTC
+        local_tz = get_local_timezone()
+        now_utc = datetime.now(pytz.UTC)
+        now = datetime.now(local_tz)
 
-        # Вчера в Новосибирском времени
-        target_day_nsk = (now_nsk - timedelta(days=1)).date()
+        logger.info(f"Серверное время (UTC):       {now_utc.strftime('%d.%m.%Y %H:%M:%S UTC')}")
+        logger.info(f"Локальное время ({TIMEZONE}): {now.strftime('%d.%m.%Y %H:%M:%S %Z')}")
 
-        # Начало и конец дня в Новосибирском времени
-        start_nsk = NSK_TZ.localize(datetime.combine(target_day_nsk, dt_time(0, 0)))
-        end_nsk = NSK_TZ.localize(datetime.combine(target_day_nsk, dt_time(23, 59, 59)))
+        # Вычисляем целевой день в локальном времени
+        target_day = (now - timedelta(days=1)).date()
 
-        # Конвертируем в московское время (где публикуются тендеры)
-        start_msk = start_nsk.astimezone(MSK_TZ)
-        end_msk = end_nsk.astimezone(MSK_TZ)
+        # Создаём временные границы целевого дня
+        start_dt = datetime.combine(target_day, dt_time(0, 0))
+        end_dt = datetime.combine(target_day, dt_time(23, 59, 59))
 
-        # Конвертируем в UTC для API TenderPlan
-        from_ts = tender_ts(start_msk.astimezone(UTC_TZ).replace(tzinfo=None))
-        to_ts = tender_ts(end_msk.astimezone(UTC_TZ).replace(tzinfo=None))
+        # Локализуем в локальный часовой пояс
+        start_dt_local = local_tz.localize(start_dt)
+        end_dt_local = local_tz.localize(end_dt)
 
-        logger.info(f"Текущее время (NSK): {now_nsk.strftime('%d.%m.%Y %H:%M:%S %Z')}")
-        logger.info(f"Период загрузки (NSK): {target_day_nsk.strftime('%d.%m.%Y')}")
-        logger.info(
-            f"Период запроса (MSK): {start_msk.strftime('%d.%m.%Y %H:%M:%S')} - {end_msk.strftime('%d.%m.%Y %H:%M:%S')}")
+        # Преобразуем в UTC для API
+        start_dt_utc = start_dt_local.astimezone(pytz.UTC)
+        end_dt_utc = end_dt_local.astimezone(pytz.UTC)
+
+        from_ts = tender_ts(start_dt_utc)
+        to_ts = tender_ts(end_dt_utc)
+
+        logger.info(f"Период загрузки: {target_day.strftime('%d.%m.%Y')}")
+        logger.info(f"Начало ({TIMEZONE}): {start_dt_local.strftime('%d.%m.%Y %H:%M:%S %Z')}")
+        logger.info(f"Конец ({TIMEZONE}):  {end_dt_local.strftime('%d.%m.%Y %H:%M:%S %Z')}")
         logger.info(f"Timestamp: {from_ts} - {to_ts}")
 
         headers = {"Authorization": f"Bearer {API_TOKEN}"}
         all_tenders = []
         page = 0
         failed_pages = []
+        skipped_tenders = []  # 🔧 Список пропущенных тендеров
 
         # ========== ЭТАП 2: Получение тендеров =========
         logger.info("ЭТАП 2: Загрузка тендеров с TenderPlan API")
@@ -870,7 +894,8 @@ def load_tenders():
                 "status": "success",
                 "message": "Нет тендеров за вчера",
                 "added": 0,
-                "failed_pages": failed_pages
+                "failed_pages": failed_pages,
+                "skipped": 0
             }
 
         logger.info(f"Всего загружено тендеров: {len(all_tenders)}")
@@ -894,23 +919,35 @@ def load_tenders():
 
         rows = []
         max_docs = 0
-        now_nsk_str = now_nsk.strftime("%d.%m.%Y %H:%M")
+        now_str = now.strftime("%d.%m.%Y %H:%M")
         processing_errors = []
 
         for idx, t in enumerate(all_tenders):
             try:
                 tender_id = t.get("_id", "unknown")
+                placing_way = t.get("placingWay", -1)
+
+                # 🔧 ПРОВЕРКА: Пропускаем исключённые способы размещения
+                if should_skip_tender(placing_way):
+                    placing_name = PLACING_WAYS.get(placing_way, "Неизвестно")
+                    skipped_tenders.append({
+                        "id": tender_id,
+                        "placing_way": placing_way,
+                        "placing_name": placing_name
+                    })
+                    logger.debug(f"Пропущен тендер {tender_id}: способ размещения '{placing_name}' ({placing_way})")
+                    continue
 
                 customers = t.get("customers", [])
                 customer_names = ", ".join([c.get("name", "") for c in customers])
 
-                placing_name = PLACING_WAYS.get(t.get("placingWay"), "Неизвестно")
+                placing_name = PLACING_WAYS.get(placing_way, "Неизвестно")
 
                 attachments = fetch_attachments(tender_id, headers)
                 max_docs = max(max_docs, len(attachments))
 
                 row = [
-                    now_nsk_str,
+                    now_str,
                     tender_id,
                     t.get("orderName", ""),
                     customer_names,
@@ -940,6 +977,7 @@ def load_tenders():
                 logger.debug(f"Обработано {idx + 1} тендеров...")
 
         logger.info(f"✅ Обработано {len(rows)} тендеров успешно")
+        logger.info(f"⏭️ Пропущено {len(skipped_tenders)} тендеров (исключённые способы размещения)")
 
         if processing_errors:
             logger.warning(f"⚠️ Ошибок при обработке: {len(processing_errors)}")
@@ -1002,9 +1040,13 @@ def load_tenders():
             "status": "success",
             "added": len(rows),
             "total_fetched": len(all_tenders),
+            "skipped": len(skipped_tenders),
+            "skipped_details": skipped_tenders[:10] if skipped_tenders else [],  # Показываем первые 10
             "processing_errors": len(processing_errors),
             "failed_pages": failed_pages,
-            "timestamp": now_nsk_str
+            "timestamp": now_str,
+            "target_date": target_day.strftime("%d.%m.%Y"),
+            "timezone": TIMEZONE
         }
 
     except Exception as e:
@@ -1045,29 +1087,27 @@ def get_info():
         "app": "Tender Loader API + Parser",
         "version": "2.1",
         "config": {
+            "timezone": TIMEZONE,
             "max_file_size_mb": MAX_FILE_SIZE_MB,
             "download_timeout_sec": DOWNLOAD_TIMEOUT_SEC,
             "parse_timeout_sec": PARSE_TIMEOUT_SEC,
-            "timezones": {
-                "server": "UTC (Render)",
-                "tenders_published": "Europe/Moscow (MSK, UTC+3)",
-                "script_runs_at": "Asia/Novosibirsk (NSK, UTC+7)"
-            }
+            "excluded_placing_ways": list(EXCLUDED_PLACING_WAYS)
         },
         "endpoints": {
             "GET /ping": "Health check (keep-alive)",
             "GET /health": "Detailed service check",
-            "GET /test-timezone": "🆕 Test timezone conversion",
+            "GET /check-time": "Check current time in different timezones",
             "POST /parse-doc": "Parse DOC/DOCX document (async, optimized)",
-            "GET /load-tenders": "Load tenders from TenderPlan (FIXED)",
+            "GET /load-tenders": "Load tenders from TenderPlan",
             "GET /errors": "View errors log",
             "GET /info": "API info and config"
         },
         "improvements": {
-            "timezone_handling": "✅ Proper UTC → MSK → NSK conversion",
+            "timezone": "✅ Converted to local timezone (Asia/Novosibirsk by default)",
             "parse_doc": "✅ Stream download + parsing from memory (3x faster)",
             "async": "✅ Non-blocking async processing",
             "error_handling": "✅ Comprehensive error tracking",
+            "filtering": "✅ Exclude specific placing ways (e.g., electronic auctions)",
             "render_compatible": "✅ No localhost calls, no disk I/O"
         }
     }
